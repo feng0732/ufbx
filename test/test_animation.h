@@ -3464,6 +3464,304 @@ static void ufbxt_assert_close_extrapolation(ufbxt_diff_error *p_err, ufbx_real 
 }
 #endif
 
+#if UFBXT_IMPL
+static int64_t ufbxt_extrapolation_tick(double time, int64_t ticks_per_second)
+{
+	return (int64_t)floor(time * (double)ticks_per_second + 0.5);
+}
+
+// Independent oracle for the finite repeating modes.  It deliberately works
+// from the source time interval, endpoint values and repetition count rather
+// than copying the hard-coded reference samples.
+static double ufbxt_expected_finite_extrapolation(const ufbx_anim_curve *curve, double time)
+{
+	ufbxt_assert(curve->keyframes.count >= 2);
+
+	double min_time = curve->min_time;
+	double max_time = curve->max_time;
+	double first_value = curve->keyframes.data[0].value;
+	double last_value = curve->keyframes.data[curve->keyframes.count - 1].value;
+
+	if (time >= min_time && time <= max_time) {
+		return ufbx_evaluate_curve_flags(curve, time, first_value,
+			UFBX_EVALUATE_FLAG_NO_EXTRAPOLATION);
+	}
+
+	bool pre = time < min_time;
+	ufbx_extrapolation ext = pre ? curve->pre_extrapolation : curve->post_extrapolation;
+	double endpoint_value = pre ? first_value : last_value;
+
+	if (ext.mode == UFBX_EXTRAPOLATION_CONSTANT || ext.repeat_count == 0) {
+		return endpoint_value;
+	}
+
+	ufbxt_assert(ext.mode == UFBX_EXTRAPOLATION_REPEAT
+		|| ext.mode == UFBX_EXTRAPOLATION_MIRROR
+		|| ext.mode == UFBX_EXTRAPOLATION_REPEAT_RELATIVE);
+
+	int64_t ticks_per_second = curve->element.scene->metadata.ktime_second;
+	int64_t min_tick = ufbxt_extrapolation_tick(min_time, ticks_per_second);
+	int64_t max_tick = ufbxt_extrapolation_tick(max_time, ticks_per_second);
+	int64_t time_tick = ufbxt_extrapolation_tick(time, ticks_per_second);
+	int64_t duration = max_tick - min_tick;
+	int64_t delta = pre ? min_tick - time_tick : time_tick - max_tick;
+
+	if (duration < 1) {
+		return endpoint_value;
+	}
+
+	int64_t repetition = delta / duration;
+	int64_t remainder = delta % duration;
+
+	// Once the requested number of repetitions has elapsed, hold the value
+	// at the end of the last generated repetition.
+	if (ext.repeat_count > 0 && repetition >= (int64_t)ext.repeat_count) {
+		repetition = (int64_t)ext.repeat_count - 1;
+		remainder = duration;
+	}
+
+	if (ext.mode == UFBX_EXTRAPOLATION_MIRROR && (repetition % 2) == 0) {
+		remainder = duration - remainder;
+	}
+
+	if (pre) {
+		remainder = duration - remainder;
+	}
+
+	int64_t source_tick = min_tick + remainder;
+	double source_time = (double)source_tick / (double)ticks_per_second;
+	double value = ufbx_evaluate_curve_flags(curve, source_time, endpoint_value,
+		UFBX_EVALUATE_FLAG_NO_EXTRAPOLATION);
+
+	if (ext.mode == UFBX_EXTRAPOLATION_REPEAT_RELATIVE) {
+		double endpoint_delta = last_value - first_value;
+		if (pre) endpoint_delta = -endpoint_delta;
+		value += endpoint_delta * (double)(repetition + 1);
+	}
+
+	return value;
+}
+
+static double ufbxt_expected_no_extrapolation(const ufbx_anim_curve *curve, double time)
+{
+	if (time < curve->min_time) return curve->keyframes.data[0].value;
+	if (time > curve->max_time) return curve->keyframes.data[curve->keyframes.count - 1].value;
+	return ufbx_evaluate_curve_flags(curve, time, 0.0f, UFBX_EVALUATE_FLAG_NO_EXTRAPOLATION);
+}
+
+static ufbx_anim_curve *ufbxt_find_pcube_translation_curve(ufbx_scene *scene)
+{
+	ufbx_node *node = ufbx_find_node(scene, "pCube1");
+	ufbxt_assert(node);
+	ufbxt_assert(scene->anim_layers.count > 0);
+
+	ufbx_anim_prop *anim_prop = ufbx_find_anim_prop(scene->anim_layers.data[0],
+		&node->element, UFBX_Lcl_Translation);
+	ufbxt_assert(anim_prop);
+	ufbxt_assert(anim_prop->anim_value);
+	ufbxt_assert(anim_prop->anim_value->curves[0]);
+	return anim_prop->anim_value->curves[0];
+}
+
+static void ufbxt_check_finite_extrapolation_pose(ufbx_scene *scene, ufbxt_diff_error *err)
+{
+	ufbx_node *node = ufbx_find_node(scene, "pCube1");
+	ufbx_anim_curve *curve = ufbxt_find_pcube_translation_curve(scene);
+
+	static const int frames[] = {
+		-10000, -1000, -120, -80, -70, -50, -48, -47, -46, -45, -44, -43, -42,
+		-30, -26, -25, -24, -16, -8, -5, -2, -1, 0, 1, 2, 7, 12, 16, 18, 20,
+		23, 24, 25, 26, 29, 30, 42, 43, 46, 47, 48, 50, 65, 68, 69, 70, 74,
+		89, 92, 93, 94, 100, 120, 1000, 10000
+	};
+
+	for (size_t i = 0; i < ufbxt_arraycount(frames); i++) {
+		int frame = frames[i];
+		double time = (double)frame / 24.0;
+		double expected = ufbxt_expected_finite_extrapolation(curve, time);
+		double expected_without_ext = ufbxt_expected_no_extrapolation(curve, time);
+
+		ufbxt_hintf("finite extrapolation frame=%d time=%.6f", frame, time);
+
+		ufbx_real sampled = ufbx_evaluate_curve(curve, time, 0.0f);
+		ufbxt_assert_close_double(err, (double)sampled, expected);
+
+		ufbx_transform transform = ufbx_evaluate_transform(scene->anim, node, time);
+		ufbxt_assert_close_vec3_xyz(err, transform.translation,
+			(ufbx_real)expected, 0.0f, 0.0f);
+
+		ufbx_evaluate_opts eval_opts = { 0 };
+		ufbx_scene *evaluated = ufbx_evaluate_scene(scene, scene->anim, time,
+			&eval_opts, NULL);
+		ufbxt_assert(evaluated);
+		ufbx_node *evaluated_node = ufbx_find_node(evaluated, "pCube1");
+		ufbxt_assert(evaluated_node);
+		ufbxt_assert_close_vec3_xyz(err, evaluated_node->local_transform.translation,
+			(ufbx_real)expected, 0.0f, 0.0f);
+		ufbx_free_scene(evaluated);
+
+		ufbx_transform clamped = ufbx_evaluate_transform_flags(scene->anim, node,
+			time, UFBX_TRANSFORM_FLAG_NO_EXTRAPOLATION);
+		ufbxt_assert_close_vec3_xyz(err, clamped.translation,
+			(ufbx_real)expected_without_ext, 0.0f, 0.0f);
+
+		ufbx_evaluate_opts no_ext_opts = { 0 };
+		no_ext_opts.evaluate_flags |= UFBX_EVALUATE_FLAG_NO_EXTRAPOLATION;
+		ufbx_scene *no_ext_scene = ufbx_evaluate_scene(scene, scene->anim, time,
+			&no_ext_opts, NULL);
+		ufbxt_assert(no_ext_scene);
+		ufbx_node *no_ext_node = ufbx_find_node(no_ext_scene, "pCube1");
+		ufbxt_assert(no_ext_node);
+		ufbxt_assert_close_vec3_xyz(err, no_ext_node->local_transform.translation,
+			(ufbx_real)expected_without_ext, 0.0f, 0.0f);
+		ufbx_free_scene(no_ext_scene);
+	}
+}
+
+static ufbx_scene *ufbxt_load_combined_trs_extrapolation(const char *file_name)
+{
+	ufbx_error error;
+	size_t file_size = 0;
+	void *file_data = ufbxt_read_file(file_name, &file_size);
+	ufbxt_assert(file_data);
+	char *source = (char*)file_data;
+
+	char *prop_name = NULL;
+	char *scan = source;
+	while ((scan = strstr(scan, "\"Lcl Translation\"")) != NULL) {
+		prop_name = scan;
+		scan++;
+	}
+	ufbxt_assert(prop_name);
+
+	char *line_start = prop_name;
+	while (line_start > source && line_start[-1] != '\n') line_start--;
+
+	unsigned long long curve_node_id = 0;
+	unsigned long long model_id = 0;
+	int scanned = sscanf(line_start, " C: \"OP\",%llu,%llu, \"Lcl Translation\"",
+		&curve_node_id, &model_id);
+	ufbxt_assert(scanned == 2);
+
+	char *line_end = strchr(prop_name, '\n');
+	ufbxt_assert(line_end);
+	size_t prefix_size = (size_t)(line_end + 1 - source);
+
+	char connections[256];
+	int connection_size = snprintf(connections, sizeof(connections),
+		"\tC: \"OP\",%llu,%llu, \"Lcl Rotation\"\n"
+		"\tC: \"OP\",%llu,%llu, \"Lcl Scaling\"\n",
+		curve_node_id, model_id, curve_node_id, model_id);
+	ufbxt_assert(connection_size > 0 && (size_t)connection_size < sizeof(connections));
+
+	size_t buffer_size = file_size + (size_t)connection_size + 1;
+	char *buffer = (char*)malloc(buffer_size);
+	ufbxt_assert(buffer);
+	memcpy(buffer, source, prefix_size);
+	memcpy(buffer + prefix_size, connections, (size_t)connection_size);
+	memcpy(buffer + prefix_size + connection_size, source + prefix_size,
+		file_size - prefix_size + 1);
+
+	static const char y_marker[] = "P: \"d|Y\", \"Number\", \"\", \"A\",0";
+	static const char z_marker[] = "P: \"d|Z\", \"Number\", \"\", \"A\",0";
+	char *y_prop = strstr(buffer, y_marker);
+	char *z_prop = strstr(buffer, z_marker);
+	ufbxt_assert(y_prop && z_prop);
+	y_prop[sizeof(y_marker) - 2] = '1';
+	z_prop[sizeof(z_marker) - 2] = '1';
+
+	ufbx_scene *scene = ufbx_load_memory(buffer, file_size + (size_t)connection_size,
+		NULL, &error);
+	if (!scene) ufbxt_log_error(&error);
+	ufbxt_assert(scene);
+
+	free(buffer);
+	free(file_data);
+	return scene;
+}
+
+static void ufbxt_check_combined_trs_extrapolation(ufbx_scene *scene, ufbxt_diff_error *err)
+{
+	ufbx_node *node = ufbx_find_node(scene, "pCube1");
+	ufbxt_assert(node);
+	ufbxt_assert(scene->anim_layers.count > 0);
+
+	ufbx_anim_prop *anim_prop = ufbx_find_anim_prop(scene->anim_layers.data[0],
+		&node->element, UFBX_Lcl_Translation);
+	ufbxt_assert(anim_prop && anim_prop->anim_value && anim_prop->anim_value->curves[0]);
+	ufbx_anim_curve *curve = anim_prop->anim_value->curves[0];
+
+	static const int frames[] = {
+		-1000, -120, -70, -50, -47, -46, -45, -44, -43, -30, -24, -16, -5, -2,
+		-1, 0, 1, 2, 12, 23, 24, 25, 29, 42, 46, 47, 48, 68, 69, 70, 89, 92,
+		93, 94, 100, 120, 1000
+	};
+
+	for (size_t i = 0; i < ufbxt_arraycount(frames); i++) {
+		int frame = frames[i];
+		double time = (double)frame / 24.0;
+		double expected = ufbxt_expected_finite_extrapolation(curve, time);
+		double expected_without_ext = ufbxt_expected_no_extrapolation(curve, time);
+
+		ufbxt_hintf("combined TRS frame=%d time=%.6f", frame, time);
+
+		ufbx_vec3 expected_translation = { (ufbx_real)expected, 1.0f, 1.0f };
+		ufbx_vec3 expected_scale = { (ufbx_real)expected, 1.0f, 1.0f };
+		ufbx_vec3 expected_euler = { (ufbx_real)expected, 1.0f, 1.0f };
+		ufbx_quat expected_rotation = ufbx_euler_to_quat(expected_euler,
+			UFBX_ROTATION_ORDER_XYZ);
+
+		ufbx_transform transform = ufbx_evaluate_transform(scene->anim, node, time);
+		ufbxt_assert_close_vec3(err, transform.translation, expected_translation);
+		ufbxt_assert_close_vec3(err, transform.scale, expected_scale);
+		ufbxt_assert_close_quat(err, transform.rotation, expected_rotation);
+
+		ufbx_transform expected_transform;
+		expected_transform.translation = expected_translation;
+		expected_transform.rotation = expected_rotation;
+		expected_transform.scale = expected_scale;
+		ufbx_matrix expected_matrix = ufbx_transform_to_matrix(&expected_transform);
+
+		ufbx_evaluate_opts eval_opts = { 0 };
+		ufbx_scene *evaluated = ufbx_evaluate_scene(scene, scene->anim, time,
+			&eval_opts, NULL);
+		ufbxt_assert(evaluated);
+		ufbx_node *evaluated_node = ufbx_find_node(evaluated, "pCube1");
+		ufbxt_assert(evaluated_node);
+		ufbxt_assert_close_matrix(err, evaluated_node->node_to_world, expected_matrix);
+		ufbx_free_scene(evaluated);
+
+		ufbx_vec3 no_ext_translation = { (ufbx_real)expected_without_ext, 1.0f, 1.0f };
+		ufbx_vec3 no_ext_scale = { (ufbx_real)expected_without_ext, 1.0f, 1.0f };
+		ufbx_vec3 no_ext_euler = { (ufbx_real)expected_without_ext, 1.0f, 1.0f };
+		ufbx_quat no_ext_rotation = ufbx_euler_to_quat(no_ext_euler,
+			UFBX_ROTATION_ORDER_XYZ);
+
+		ufbx_transform clamped = ufbx_evaluate_transform_flags(scene->anim, node, time,
+			UFBX_TRANSFORM_FLAG_NO_EXTRAPOLATION);
+		ufbxt_assert_close_vec3(err, clamped.translation, no_ext_translation);
+		ufbxt_assert_close_vec3(err, clamped.scale, no_ext_scale);
+		ufbxt_assert_close_quat(err, clamped.rotation, no_ext_rotation);
+
+		ufbx_transform no_ext_transform;
+		no_ext_transform.translation = no_ext_translation;
+		no_ext_transform.rotation = no_ext_rotation;
+		no_ext_transform.scale = no_ext_scale;
+		ufbx_matrix no_ext_matrix = ufbx_transform_to_matrix(&no_ext_transform);
+
+		ufbx_evaluate_opts no_ext_opts = { 0 };
+		no_ext_opts.evaluate_flags |= UFBX_EVALUATE_FLAG_NO_EXTRAPOLATION;
+		ufbx_scene *no_ext_scene = ufbx_evaluate_scene(scene, scene->anim, time,
+			&no_ext_opts, NULL);
+		ufbxt_assert(no_ext_scene);
+		ufbx_node *no_ext_node = ufbx_find_node(no_ext_scene, "pCube1");
+		ufbxt_assert(no_ext_node);
+		ufbxt_assert_close_matrix(err, no_ext_node->node_to_world, no_ext_matrix);
+		ufbx_free_scene(no_ext_scene);
+	}
+}
+#endif
+
 UFBXT_FILE_TEST(maya_anim_extrapolation)
 #if UFBXT_IMPL
 {
@@ -3733,6 +4031,8 @@ UFBXT_FILE_TEST_FLAGS(motionbuilder_extrapolation_mirror_count, UFBXT_FILE_TEST_
 		ufbx_real value = ufbx_evaluate_curve(anim_curve, time, 0.0);
 		ufbxt_assert_close_extrapolation(err, value, ref_value);
 	}
+
+	ufbxt_check_finite_extrapolation_pose(scene, err);
 }
 #endif
 
@@ -3790,6 +4090,8 @@ UFBXT_FILE_TEST_FLAGS(motionbuilder_extrapolation_repeat_count, UFBXT_FILE_TEST_
 		ufbx_real value = ufbx_evaluate_curve(anim_curve, time, 0.0);
 		ufbxt_assert_close_extrapolation(err, value, ref_value);
 	}
+
+	ufbxt_check_finite_extrapolation_pose(scene, err);
 }
 #endif
 
@@ -3851,6 +4153,30 @@ UFBXT_FILE_TEST_FLAGS(motionbuilder_extrapolation_relative_count, UFBXT_FILE_TES
 
 		ufbx_real value = ufbx_evaluate_curve(anim_curve, time, 0.0);
 		ufbxt_assert_close_extrapolation(err, value, ref_value);
+	}
+
+	ufbxt_check_finite_extrapolation_pose(scene, err);
+}
+#endif
+
+UFBXT_TEST(finite_extrapolation_transform_property_combinations)
+#if UFBXT_IMPL
+{
+	ufbxt_diff_error err = { 0 };
+	static const char *const file_names[] = {
+		"motionbuilder_extrapolation_mirror_count_7700_ascii.fbx",
+		"motionbuilder_extrapolation_repeat_count_7700_ascii.fbx",
+		"motionbuilder_extrapolation_relative_count_7700_ascii.fbx",
+	};
+
+	for (size_t i = 0; i < ufbxt_arraycount(file_names); i++) {
+		char path[512];
+		snprintf(path, sizeof(path), "%s%s", data_root, file_names[i]);
+
+		ufbxt_hintf("combined property fixture=%s", path);
+		ufbx_scene *scene = ufbxt_load_combined_trs_extrapolation(path);
+		ufbxt_check_combined_trs_extrapolation(scene, &err);
+		ufbx_free_scene(scene);
 	}
 }
 #endif
