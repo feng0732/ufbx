@@ -696,3 +696,616 @@ UFBXT_FILE_TEST_FLAGS(synthetic_nurbs_order_overflow_fail, UFBXT_FILE_TEST_FLAG_
 	ufbxt_assert(!scene);
 }
 #endif
+
+// ---------------------------------------------------------------------------
+// Rational NURBS surfaces: geometry-contract tests.
+//
+// The expected geometry is never transcribed from another evaluator: every
+// assertion below is recomputed from the geometric contract of the surface,
+// i.e. its control points (with explicit homogeneous weights), the knot
+// vectors and the NURBS definition. An independent Cox-de Boor reference
+// evaluator is built from scratch in these tests so the checks do not share
+// any code path with `ufbx_evaluate_nurbs_surface()`.
+//
+// Inline FBX 7.7 ASCII documents are loaded through `ufbx_load_memory()`,
+// keeping the tests self-contained (no external data files).
+
+#if UFBXT_IMPL
+
+// Independent reference evaluator for open (clamped) rational NURBS surfaces.
+// Knot indices are passed explicitly instead of reusing ufbx basis data so
+// the reference stays independent of the library's span bookkeeping.
+
+static double ufbxt_ref_nurbs_basis(const ufbx_real *knots, size_t num_knots,
+	size_t i, size_t degree, ufbx_real t)
+{
+	if (degree == 0) {
+		// Half-open level-0 spans, with the terminal knot assigned to every
+		// level-0 span that ends on it (the recursion selects the active one).
+		if (t >= knots[i] && t < knots[i + 1]) return 1.0;
+		if (t == knots[num_knots - 1] && i + 1 < num_knots && knots[i + 1] == t) return 1.0;
+		return 0.0;
+	}
+
+	double left = 0.0, right = 0.0;
+	ufbx_real d_left = knots[i + degree] - knots[i];
+	ufbx_real d_right = knots[i + degree + 1] - knots[i + 1];
+	if (d_left != 0.0) {
+		left = (t - knots[i]) / d_left * ufbxt_ref_nurbs_basis(knots, num_knots, i, degree - 1, t);
+	}
+	if (d_right != 0.0) {
+		right = (knots[i + degree + 1] - t) / d_right
+			* ufbxt_ref_nurbs_basis(knots, num_knots, i + 1, degree - 1, t);
+	}
+	return left + right;
+}
+
+static double ufbxt_ref_nurbs_basis_deriv(const ufbx_real *knots, size_t num_knots,
+	size_t i, size_t degree, ufbx_real t)
+{
+	double left = 0.0, right = 0.0;
+	ufbx_real d_left = knots[i + degree] - knots[i];
+	ufbx_real d_right = knots[i + degree + 1] - knots[i + 1];
+	if (d_left != 0.0) {
+		left = (double)degree / d_left * ufbxt_ref_nurbs_basis(knots, num_knots, i, degree - 1, t);
+	}
+	if (d_right != 0.0) {
+		right = (double)degree / d_right * ufbxt_ref_nurbs_basis(knots, num_knots, i + 1, degree - 1, t);
+	}
+	return left - right;
+}
+
+typedef struct {
+	double x, y, z, w;
+} ufbxt_ref_vec4;
+
+// mode: 0 = surface value, 1 = derivative over U, 2 = derivative over V.
+// Returns the accumulated homogeneous point (the perspective divide is left
+// to the caller, which is also what makes the rational weights observable).
+static ufbxt_ref_vec4 ufbxt_ref_evaluate_rational_surface(const ufbx_nurbs_surface *surface,
+	ufbx_real u, ufbx_real v, int mode)
+{
+	size_t num_u = surface->num_control_points_u;
+	size_t num_v = surface->num_control_points_v;
+	size_t degree_u = surface->basis_u.order - 1;
+	size_t degree_v = surface->basis_v.order - 1;
+	const ufbx_real *knots_u = surface->basis_u.knot_vector.data;
+	const ufbx_real *knots_v = surface->basis_v.knot_vector.data;
+	size_t num_knots_u = surface->basis_u.knot_vector.count;
+	size_t num_knots_v = surface->basis_v.knot_vector.count;
+
+	ufbxt_ref_vec4 result = { 0.0, 0.0, 0.0, 0.0 };
+
+	for (size_t j = 0; j < num_v; j++) {
+		double basis_v = ufbxt_ref_nurbs_basis(knots_v, num_knots_v, j, degree_v, v);
+		double deriv_v = ufbxt_ref_nurbs_basis_deriv(knots_v, num_knots_v, j, degree_v, v);
+		for (size_t i = 0; i < num_u; i++) {
+			double basis_u = ufbxt_ref_nurbs_basis(knots_u, num_knots_u, i, degree_u, u);
+			double deriv_u = ufbxt_ref_nurbs_basis_deriv(knots_u, num_knots_u, i, degree_u, u);
+
+			double fu = mode == 1 ? deriv_u : basis_u;
+			double fv = mode == 2 ? deriv_v : basis_v;
+
+			ufbx_vec4 cp = surface->control_points.data[j * num_u + i];
+			double homogeneous_weight = fu * fv * cp.w;
+			result.x += cp.x * homogeneous_weight;
+			result.y += cp.y * homogeneous_weight;
+			result.z += cp.z * homogeneous_weight;
+			result.w += homogeneous_weight;
+		}
+	}
+
+	return result;
+}
+
+static ufbx_vec3 ufbxt_ref_project(ufbxt_ref_vec4 homogeneous)
+{
+	ufbx_vec3 result = {
+		(ufbx_real)(homogeneous.x / homogeneous.w),
+		(ufbx_real)(homogeneous.y / homogeneous.w),
+		(ufbx_real)(homogeneous.z / homogeneous.w),
+	};
+	return result;
+}
+
+// Quotient rule for rational curves/surfaces: S' = (A' - W'*S) / W
+static ufbx_vec3 ufbxt_ref_project_deriv(ufbxt_ref_vec4 value, ufbxt_ref_vec4 deriv,
+	ufbx_vec3 projected_value)
+{
+	ufbx_vec3 result = {
+		(ufbx_real)((deriv.x - deriv.w * projected_value.x) / value.w),
+		(ufbx_real)((deriv.y - deriv.w * projected_value.y) / value.w),
+		(ufbx_real)((deriv.z - deriv.w * projected_value.z) / value.w),
+	};
+	return result;
+}
+
+static double ufbxt_vec3_l1(ufbx_vec3 a, ufbx_vec3 b)
+{
+	return fabs(a.x - b.x) + fabs(a.y - b.y) + fabs(a.z - b.z);
+}
+
+// Independent reference recomputation tolerates only floating point roundoff:
+// double builds compare at ~1e-12 magnitudes while the single-precision build
+// needs a few ULPs of `float` slack. It is still orders of magnitude tighter
+// than the 1e-3 diff tolerance used for transcribed sample tables.
+static double ufbxt_ref_epsilon(void)
+{
+	return sizeof(ufbx_real) >= sizeof(double) ? 1e-9 : 1e-5;
+}
+
+static double ufbxt_vec3_dot_ref(ufbx_vec3 a, ufbx_vec3 b)
+{
+	return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static double ufbxt_vec3_length_ref(ufbx_vec3 a)
+{
+	return sqrt(ufbxt_vec3_dot_ref(a, a));
+}
+
+#endif
+
+// Single rational patch: degree 2 x degree 2, 4 x 3 control points with
+// non-unit homogeneous weights and a two-span (non-uniform) U knot vector.
+// Position and both tangents must match the contract on a dense grid that
+// covers both spans, the interior knot and both parameter boundaries.
+UFBXT_TEST(rational_nurbs_surface_geometry_contract)
+#if UFBXT_IMPL
+{
+	static const char fbx[] =
+			"; FBX 7.7.0 project file\n"
+			"FBXHeaderExtension:  {\n"
+			"    FBXHeaderVersion: 1004\n"
+			"    FBXVersion: 7700\n"
+			"}\n"
+			"GlobalSettings:  {\n"
+			"    Version: 1000\n"
+			"    Properties70:  {\n"
+			"        P: \"UpAxis\", \"int\", \"Integer\", \"\",1\n"
+			"        P: \"UpAxisSign\", \"int\", \"Integer\", \"\",1\n"
+			"        P: \"FrontAxis\", \"int\", \"Integer\", \"\",2\n"
+			"        P: \"FrontAxisSign\", \"int\", \"Integer\", \"\",1\n"
+			"        P: \"CoordAxis\", \"int\", \"Integer\", \"\",0\n"
+			"        P: \"CoordAxisSign\", \"int\", \"Integer\", \"\",1\n"
+			"        P: \"UnitScaleFactor\", \"double\", \"Number\", \"\",100\n"
+			"    }\n"
+			"}\n"
+			"Objects:  {\n"
+			"    Geometry: 1000, \"Geometry::\", \"NurbsSurface\" {\n"
+			"        Type: \"NurbsSurface\"\n"
+			"        NurbsSurfaceVersion: 100\n"
+			"        SurfaceDisplay: 4,4,4\n"
+			"        NurbsSurfaceOrder: 3,3\n"
+			"        Dimensions: 4,3\n"
+			"        Step: 1,1\n"
+			"        Form: \"Open\", \"Open\"\n"
+			"        Points: *48 {\n"
+			"            a: 0,0,0,1.25,1,0.25,0.3133307638509934,1.4677888764261189,2,1,0.38953905235127806,1.7583004518551348,3,2.25,0.17095195209353192,1.0944944356782451,-0.25,0.75,0,1.6554024920676662,0.75,1,0.30860303865307881,1.7857778116577632,1.75,1.75,0.42150045330367547,0.89980020698000618,2.75,3,0.29109273450112505,1.7400425716625916,-0.5,1.5,0,1.9431994763267282,0.5,1.75,0.21353783199750687,0.76588582817730089,1.5,2.5,0.34115249629098054,1.6171291678250943,2.5,3.75,0.36194576548401614,2.2039312750313393\n"
+			"        } \n"
+			"        KnotVectorU: *7 {\n"
+			"            a: 0,0,0,1,2,2,2\n"
+			"        } \n"
+			"        KnotVectorV: *6 {\n"
+			"            a: 0,0,0,1,1,1\n"
+			"        } \n"
+			"        GeometryVersion: 124\n"
+			"    }\n"
+			"    Model: 2000, \"Model::contractSurf\", \"NurbsSurface\" {\n"
+			"        Version: 232\n"
+			"        Properties70:  {\n"
+			"            P: \"InheritType\", \"enum\", \"\", \"\",1\n"
+			"        }\n"
+			"        Shading: T\n"
+			"        Culling: \"CullingOff\"\n"
+			"    }\n"
+			"}\n"
+			"Connections:  {\n"
+			"    C: \"OO\",1000,2000\n"
+			"    C: \"OO\",2000,0\n"
+			"}\n"
+			"Takes:  {\n"
+			"    Current: \"Take 001\"\n"
+			"}\n";
+
+
+	ufbxt_diff_error err = { 0 };
+	ufbx_error error;
+	ufbx_scene *scene = ufbx_load_memory(fbx, sizeof(fbx) - 1, NULL, &error);
+	ufbxt_assert(scene);
+	ufbxt_assert(scene->nurbs_surfaces.count == 1);
+
+	ufbx_node *node = ufbx_find_node(scene, "contractSurf");
+	ufbxt_assert(node && node->attrib_type == UFBX_ELEMENT_NURBS_SURFACE);
+	ufbx_nurbs_surface *surface = (ufbx_nurbs_surface*)node->attrib;
+
+	// Contract metadata: orders, dimensions, knot vectors and parameter range.
+	ufbxt_assert(surface->basis_u.valid && surface->basis_v.valid);
+	ufbxt_assert(surface->basis_u.order == 3 && surface->basis_v.order == 3);
+	ufbxt_assert(surface->num_control_points_u == 4);
+	ufbxt_assert(surface->num_control_points_v == 3);
+	ufbxt_assert(surface->basis_u.knot_vector.count == 7);
+	ufbxt_assert(surface->basis_v.knot_vector.count == 6);
+	ufbxt_assert_close_real(&err, surface->basis_u.t_min, 0.0f);
+	ufbxt_assert_close_real(&err, surface->basis_u.t_max, 2.0f);
+	ufbxt_assert_close_real(&err, surface->basis_v.t_min, 0.0f);
+	ufbxt_assert_close_real(&err, surface->basis_v.t_max, 1.0f);
+
+	// The contract is genuinely rational: weights are stored explicitly in
+	// the homogeneous control point components and are not all one.
+	size_t num_non_unit_weights = 0;
+	for (size_t i = 0; i < surface->control_points.count; i++) {
+		if (fabs(surface->control_points.data[i].w - 1.0) > 1e-12) {
+			num_non_unit_weights++;
+		}
+	}
+	ufbxt_assert(num_non_unit_weights == surface->control_points.count);
+
+	// Recompute the whole surface from control points, knots and weights.
+	for (size_t a = 0; a <= 40; a++) {
+		ufbx_real u = (ufbx_real)(surface->basis_u.t_min
+			+ (surface->basis_u.t_max - surface->basis_u.t_min) * (ufbx_real)a / 40.0);
+		for (size_t b = 0; b <= 20; b++) {
+			ufbxt_hintf("u: %g, v: %g", (double)u, (double)b / 20.0);
+			ufbx_real v = (ufbx_real)(surface->basis_v.t_min
+				+ (surface->basis_v.t_max - surface->basis_v.t_min) * (ufbx_real)b / 20.0);
+
+			ufbx_surface_point evaluated = ufbx_evaluate_nurbs_surface(surface, u, v);
+			ufbxt_assert(evaluated.valid);
+
+			ufbxt_ref_vec4 h_value = ufbxt_ref_evaluate_rational_surface(surface, u, v, 0);
+			ufbxt_ref_vec4 h_deriv_u = ufbxt_ref_evaluate_rational_surface(surface, u, v, 1);
+			ufbxt_ref_vec4 h_deriv_v = ufbxt_ref_evaluate_rational_surface(surface, u, v, 2);
+
+			ufbx_vec3 ref_position = ufbxt_ref_project(h_value);
+			ufbx_vec3 ref_deriv_u = ufbxt_ref_project_deriv(h_value, h_deriv_u, ref_position);
+			ufbx_vec3 ref_deriv_v = ufbxt_ref_project_deriv(h_value, h_deriv_v, ref_position);
+
+			double eps = ufbxt_ref_epsilon();
+			ufbxt_assert(ufbxt_vec3_l1(evaluated.position, ref_position) < eps);
+			ufbxt_assert(ufbxt_vec3_l1(evaluated.derivative_u, ref_deriv_u) < eps);
+			ufbxt_assert(ufbxt_vec3_l1(evaluated.derivative_v, ref_deriv_v) < eps);
+		}
+	}
+
+	// Corner points of a clamped NURBS surface coincide with the corner
+	// control points' Euclidean coordinates. The FBX contract stores control
+	// points in non-homogeneous form with a separate weight component: the
+	// homogeneous point used by the NURBS sum is `(x*w, y*w, z*w, w)`, so the
+	// projected corner is exactly `(x, y, z)`. The index follows the documented
+	// `V * num_control_points_u + U` layout instead of hard-coded magic values.
+	{
+		size_t u_last = surface->num_control_points_u - 1;
+		size_t v_last = surface->num_control_points_v - 1;
+		ufbx_real corner_u[2] = { surface->basis_u.t_min, surface->basis_u.t_max };
+		ufbx_real corner_v[2] = { surface->basis_v.t_min, surface->basis_v.t_max };
+
+		for (size_t v_side = 0; v_side < 2; v_side++) {
+			for (size_t u_side = 0; u_side < 2; u_side++) {
+				size_t corner = v_side * v_last * surface->num_control_points_u
+					+ u_side * u_last;
+				ufbx_vec4 cp = surface->control_points.data[corner];
+				ufbx_surface_point evaluated = ufbx_evaluate_nurbs_surface(surface,
+					corner_u[u_side], corner_v[v_side]);
+				// Homogeneous corner control point: (x*w, y*w, z*w, w).
+				ufbx_vec3 corner_position = ufbxt_ref_project(
+					(ufbxt_ref_vec4){ cp.x * cp.w, cp.y * cp.w, cp.z * cp.w, cp.w });
+				ufbxt_assert(ufbxt_vec3_l1(evaluated.position, corner_position) < ufbxt_ref_epsilon());
+			}
+		}
+	}
+
+	ufbx_free_scene(scene);
+}
+#endif
+
+// Two degree-2 x degree-3 rational patches sharing a boundary. The good pair
+// is constructed from one geometric contract: identical homogeneous seam
+// control points and matching v-row weights, which makes the cross-seam
+// tangents collinear (C1). Continuity is evaluated on several independent
+// sampling grids: a genuine geometric property must not depend on the grid.
+UFBXT_TEST(rational_nurbs_surface_boundary_continuity)
+#if UFBXT_IMPL
+{
+	static const char good_fbx[] =
+			"; FBX 7.7.0 project file\n"
+			"FBXHeaderExtension:  {\n"
+			"    FBXHeaderVersion: 1004\n"
+			"    FBXVersion: 7700\n"
+			"}\n"
+			"GlobalSettings:  {\n"
+			"    Version: 1000\n"
+			"    Properties70:  {\n"
+			"        P: \"UpAxis\", \"int\", \"Integer\", \"\",1\n"
+			"        P: \"UpAxisSign\", \"int\", \"Integer\", \"\",1\n"
+			"        P: \"FrontAxis\", \"int\", \"Integer\", \"\",2\n"
+			"        P: \"FrontAxisSign\", \"int\", \"Integer\", \"\",1\n"
+			"        P: \"CoordAxis\", \"int\", \"Integer\", \"\",0\n"
+			"        P: \"CoordAxisSign\", \"int\", \"Integer\", \"\",1\n"
+			"        P: \"UnitScaleFactor\", \"double\", \"Number\", \"\",100\n"
+			"    }\n"
+			"}\n"
+			"Objects:  {\n"
+			"    Geometry: 1000, \"Geometry::\", \"NurbsSurface\" {\n"
+			"        Type: \"NurbsSurface\"\n"
+			"        NurbsSurfaceVersion: 100\n"
+			"        SurfaceDisplay: 4,4,4\n"
+			"        NurbsSurfaceOrder: 3,4\n"
+			"        Dimensions: 3,4\n"
+			"        Step: 1,1\n"
+			"        Form: \"Open\", \"Open\"\n"
+			"        Points: *48 {\n"
+			"            a: 0,0,0,1.25,1,0,0,1.25,2,0,0,1.25,0,0.66666666666666663,0.17320508075688773,1.3470909948382483,1,0.66666666666666663,0.30653841409022109,1.3470909948382483,2,0.66666666666666663,0.43987174742355439,1.3470909948382483,0,1.3333333333333333,0.17320508075688776,1.3377442396402177,1,1.3333333333333333,0.43987174742355439,1.3377442396402177,2,1.3333333333333333,0.70653841409022111,1.3377442396402177,0,2,2.4492935982947065e-17,1.6164940024612156,1,2,0.40000000000000002,1.6164940024612156,2,2,0.80000000000000004,1.6164940024612156\n"
+			"        } \n"
+			"        KnotVectorU: *6 {\n"
+			"            a: 0,0,0,1,1,1\n"
+			"        } \n"
+			"        KnotVectorV: *8 {\n"
+			"            a: 0,0,0,0,1,1,1,1\n"
+			"        } \n"
+			"        GeometryVersion: 124\n"
+			"    }\n"
+			"    Model: 2000, \"Model::surfA\", \"NurbsSurface\" {\n"
+			"        Version: 232\n"
+			"        Properties70:  {\n"
+			"            P: \"InheritType\", \"enum\", \"\", \"\",1\n"
+			"        }\n"
+			"        Shading: T\n"
+			"        Culling: \"CullingOff\"\n"
+			"    }\n"
+			"    Geometry: 1001, \"Geometry::\", \"NurbsSurface\" {\n"
+			"        Type: \"NurbsSurface\"\n"
+			"        NurbsSurfaceVersion: 100\n"
+			"        SurfaceDisplay: 4,4,4\n"
+			"        NurbsSurfaceOrder: 3,4\n"
+			"        Dimensions: 3,4\n"
+			"        Step: 1,1\n"
+			"        Form: \"Open\", \"Open\"\n"
+			"        Points: *48 {\n"
+			"            a: 2,0,0,1.25,3,0,0,1.25,6,0,0,1.25,2,0.66666666666666663,0.43987174742355439,1.3470909948382483,3,0.66666666666666663,0.5732050807568877,1.3470909948382483,6,0.66666666666666663,0.97320508075688772,1.3470909948382483,2,1.3333333333333333,0.70653841409022111,1.3377442396402177,3,1.3333333333333333,0.97320508075688783,1.3377442396402177,6,1.3333333333333333,1.7732050807568878,1.3377442396402177,2,2,0.80000000000000004,1.6164940024612156,3,2,1.2000000000000002,1.6164940024612156,6,2,2.4000000000000004,1.6164940024612156\n"
+			"        } \n"
+			"        KnotVectorU: *6 {\n"
+			"            a: 0,0,0,1,1,1\n"
+			"        } \n"
+			"        KnotVectorV: *8 {\n"
+			"            a: 0,0,0,0,1,1,1,1\n"
+			"        } \n"
+			"        GeometryVersion: 124\n"
+			"    }\n"
+			"    Model: 2001, \"Model::surfB\", \"NurbsSurface\" {\n"
+			"        Version: 232\n"
+			"        Properties70:  {\n"
+			"            P: \"InheritType\", \"enum\", \"\", \"\",1\n"
+			"        }\n"
+			"        Shading: T\n"
+			"        Culling: \"CullingOff\"\n"
+			"    }\n"
+			"}\n"
+			"Connections:  {\n"
+			"    C: \"OO\",1000,2000\n"
+			"    C: \"OO\",2000,0\n"
+			"    C: \"OO\",1001,2001\n"
+			"    C: \"OO\",2001,0\n"
+			"}\n"
+			"Takes:  {\n"
+			"    Current: \"Take 001\"\n"
+			"}\n";
+
+
+	ufbxt_diff_error err = { 0 };
+	ufbx_error error;
+	ufbx_scene *scene = ufbx_load_memory(good_fbx, sizeof(good_fbx) - 1, NULL, &error);
+	ufbxt_assert(scene);
+	ufbxt_assert(scene->nurbs_surfaces.count == 2);
+
+	ufbx_nurbs_surface *patch_a = (ufbx_nurbs_surface*)
+		ufbx_find_node(scene, "surfA")->attrib;
+	ufbx_nurbs_surface *patch_b = (ufbx_nurbs_surface*)
+		ufbx_find_node(scene, "surfB")->attrib;
+	ufbxt_assert(patch_a->basis_u.valid && patch_b->basis_u.valid);
+
+	// The homogeneous seam control points are part of the contract: they must
+	// be identical point-for-point (xyz and weight) on both patches.
+	ufbxt_assert(patch_a->num_control_points_v == patch_b->num_control_points_v);
+	for (size_t j = 0; j < patch_a->num_control_points_v; j++) {
+		ufbx_vec4 a_seam = patch_a->control_points.data[j * patch_a->num_control_points_u
+			+ (patch_a->num_control_points_u - 1)];
+		ufbx_vec4 b_seam = patch_b->control_points.data[j * patch_b->num_control_points_u];
+		ufbxt_assert_close_vec4(&err, a_seam, b_seam);
+	}
+
+	static const size_t grid_sizes[] = { 2, 3, 7, 13, 26, 50 };
+	for (size_t grid_ix = 0; grid_ix < ufbxt_arraycount(grid_sizes); grid_ix++) {
+		size_t steps = grid_sizes[grid_ix];
+		ufbxt_hintf("grid: %zu", steps);
+
+		for (size_t k = 0; k <= steps; k++) {
+			ufbx_real v = (ufbx_real)k / (ufbx_real)steps;
+
+			ufbx_surface_point side_a = ufbx_evaluate_nurbs_surface(patch_a,
+				patch_a->basis_u.t_max, v);
+			ufbx_surface_point side_b = ufbx_evaluate_nurbs_surface(patch_b,
+				patch_b->basis_u.t_min, v);
+
+			// C0: both sides evaluate to the same point on every grid.
+			double eps = ufbxt_ref_epsilon();
+			ufbxt_assert(ufbxt_vec3_l1(side_a.position, side_b.position) < eps);
+
+			// C1: cross-boundary U tangents are collinear and equally oriented.
+			double len_a = ufbxt_vec3_length_ref(side_a.derivative_u);
+			double len_b = ufbxt_vec3_length_ref(side_b.derivative_u);
+			ufbxt_assert(len_a > 1e-9 && len_b > 1e-9);
+			double cos_angle = ufbxt_vec3_dot_ref(side_a.derivative_u, side_b.derivative_u)
+				/ (len_a * len_b);
+			ufbxt_assert(cos_angle > 1.0 - ufbxt_ref_epsilon());
+
+			// The V tangents run along the shared seam and must match as well.
+			ufbxt_assert(ufbxt_vec3_l1(side_a.derivative_v, side_b.derivative_v) < ufbxt_ref_epsilon());
+
+			// Both evaluated points are independently reproducible from the
+			// contract of their own patch.
+			ufbxt_ref_vec4 h_a = ufbxt_ref_evaluate_rational_surface(patch_a,
+				patch_a->basis_u.t_max, v, 0);
+			ufbxt_ref_vec4 h_b = ufbxt_ref_evaluate_rational_surface(patch_b,
+				patch_b->basis_u.t_min, v, 0);
+			ufbxt_assert(ufbxt_vec3_l1(side_a.position, ufbxt_ref_project(h_a)) < eps);
+			ufbxt_assert(ufbxt_vec3_l1(side_b.position, ufbxt_ref_project(h_b)) < eps);
+		}
+	}
+
+	ufbx_free_scene(scene);
+}
+#endif
+
+// Negative control: the same assembly with the seam control points moved and
+// reweighted represents a different geometric contract. The continuity checks
+// must identify the broken surface shape regardless of how the seam is
+// sampled, proving the test discriminates shapes rather than grid patterns.
+UFBXT_TEST(rational_nurbs_surface_boundary_mismatch_detected)
+#if UFBXT_IMPL
+{
+	static const char bad_fbx[] =
+			"; FBX 7.7.0 project file\n"
+			"FBXHeaderExtension:  {\n"
+			"    FBXHeaderVersion: 1004\n"
+			"    FBXVersion: 7700\n"
+			"}\n"
+			"GlobalSettings:  {\n"
+			"    Version: 1000\n"
+			"    Properties70:  {\n"
+			"        P: \"UpAxis\", \"int\", \"Integer\", \"\",1\n"
+			"        P: \"UpAxisSign\", \"int\", \"Integer\", \"\",1\n"
+			"        P: \"FrontAxis\", \"int\", \"Integer\", \"\",2\n"
+			"        P: \"FrontAxisSign\", \"int\", \"Integer\", \"\",1\n"
+			"        P: \"CoordAxis\", \"int\", \"Integer\", \"\",0\n"
+			"        P: \"CoordAxisSign\", \"int\", \"Integer\", \"\",1\n"
+			"        P: \"UnitScaleFactor\", \"double\", \"Number\", \"\",100\n"
+			"    }\n"
+			"}\n"
+			"Objects:  {\n"
+			"    Geometry: 1000, \"Geometry::\", \"NurbsSurface\" {\n"
+			"        Type: \"NurbsSurface\"\n"
+			"        NurbsSurfaceVersion: 100\n"
+			"        SurfaceDisplay: 4,4,4\n"
+			"        NurbsSurfaceOrder: 3,4\n"
+			"        Dimensions: 3,4\n"
+			"        Step: 1,1\n"
+			"        Form: \"Open\", \"Open\"\n"
+			"        Points: *48 {\n"
+			"            a: 0,0,0,1.25,1,0,0,1.25,2,0,0,1.25,0,0.66666666666666663,0.17320508075688773,1.3470909948382483,1,0.66666666666666663,0.30653841409022109,1.3470909948382483,2,0.66666666666666663,0.43987174742355439,1.3470909948382483,0,1.3333333333333333,0.17320508075688776,1.3377442396402177,1,1.3333333333333333,0.43987174742355439,1.3377442396402177,2,1.3333333333333333,0.70653841409022111,1.3377442396402177,0,2,2.4492935982947065e-17,1.6164940024612156,1,2,0.40000000000000002,1.6164940024612156,2,2,0.80000000000000004,1.6164940024612156\n"
+			"        } \n"
+			"        KnotVectorU: *6 {\n"
+			"            a: 0,0,0,1,1,1\n"
+			"        } \n"
+			"        KnotVectorV: *8 {\n"
+			"            a: 0,0,0,0,1,1,1,1\n"
+			"        } \n"
+			"        GeometryVersion: 124\n"
+			"    }\n"
+			"    Model: 2000, \"Model::surfA\", \"NurbsSurface\" {\n"
+			"        Version: 232\n"
+			"        Properties70:  {\n"
+			"            P: \"InheritType\", \"enum\", \"\", \"\",1\n"
+			"        }\n"
+			"        Shading: T\n"
+			"        Culling: \"CullingOff\"\n"
+			"    }\n"
+			"    Geometry: 1001, \"Geometry::\", \"NurbsSurface\" {\n"
+			"        Type: \"NurbsSurface\"\n"
+			"        NurbsSurfaceVersion: 100\n"
+			"        SurfaceDisplay: 4,4,4\n"
+			"        NurbsSurfaceOrder: 3,4\n"
+			"        Dimensions: 3,4\n"
+			"        Step: 1,1\n"
+			"        Form: \"Open\", \"Open\"\n"
+			"        Points: *48 {\n"
+			"            a: 2.3500000000000001,0,0,1.95,3,0,0,1.25,6,0,0,1.25,2.3500000000000001,0.66666666666666663,0.43987174742355439,2.0859273927735478,3,0.66666666666666663,0.5732050807568877,1.3470909948382483,6,0.66666666666666663,0.97320508075688772,1.3470909948382483,2.3500000000000001,1.3333333333333333,0.70653841409022111,2.0728419354963048,3,1.3333333333333333,0.97320508075688783,1.3377442396402177,6,1.3333333333333333,1.7732050807568878,1.3377442396402177,2.3500000000000001,2,0.80000000000000004,2.4630916034457018,3,2,1.2000000000000002,1.6164940024612156,6,2,2.4000000000000004,1.6164940024612156\n"
+			"        } \n"
+			"        KnotVectorU: *6 {\n"
+			"            a: 0,0,0,1,1,1\n"
+			"        } \n"
+			"        KnotVectorV: *8 {\n"
+			"            a: 0,0,0,0,1,1,1,1\n"
+			"        } \n"
+			"        GeometryVersion: 124\n"
+			"    }\n"
+			"    Model: 2001, \"Model::surfB\", \"NurbsSurface\" {\n"
+			"        Version: 232\n"
+			"        Properties70:  {\n"
+			"            P: \"InheritType\", \"enum\", \"\", \"\",1\n"
+			"        }\n"
+			"        Shading: T\n"
+			"        Culling: \"CullingOff\"\n"
+			"    }\n"
+			"}\n"
+			"Connections:  {\n"
+			"    C: \"OO\",1000,2000\n"
+			"    C: \"OO\",2000,0\n"
+			"    C: \"OO\",1001,2001\n"
+			"    C: \"OO\",2001,0\n"
+			"}\n"
+			"Takes:  {\n"
+			"    Current: \"Take 001\"\n"
+			"}\n";
+
+
+	ufbx_error error;
+	ufbx_scene *scene = ufbx_load_memory(bad_fbx, sizeof(bad_fbx) - 1, NULL, &error);
+	ufbxt_assert(scene);
+	ufbxt_assert(scene->nurbs_surfaces.count == 2);
+
+	ufbx_nurbs_surface *patch_a = (ufbx_nurbs_surface*)
+		ufbx_find_node(scene, "surfA")->attrib;
+	ufbx_nurbs_surface *patch_b = (ufbx_nurbs_surface*)
+		ufbx_find_node(scene, "surfB")->attrib;
+
+	// Every independent sampling grid has to expose the broken seam.
+	static const size_t grid_sizes[] = { 3, 7, 13, 26 };
+	for (size_t grid_ix = 0; grid_ix < ufbxt_arraycount(grid_sizes); grid_ix++) {
+		size_t steps = grid_sizes[grid_ix];
+		ufbxt_hintf("grid: %zu", steps);
+
+		double largest_position_gap = 0.0;
+		double smallest_tangent_cos = 1.0;
+		for (size_t k = 0; k <= steps; k++) {
+			ufbx_real v = (ufbx_real)k / (ufbx_real)steps;
+			ufbx_surface_point side_a = ufbx_evaluate_nurbs_surface(patch_a,
+				patch_a->basis_u.t_max, v);
+			ufbx_surface_point side_b = ufbx_evaluate_nurbs_surface(patch_b,
+				patch_b->basis_u.t_min, v);
+
+			double gap = ufbxt_vec3_l1(side_a.position, side_b.position);
+			if (gap > largest_position_gap) largest_position_gap = gap;
+
+			double len_a = ufbxt_vec3_length_ref(side_a.derivative_u);
+			double len_b = ufbxt_vec3_length_ref(side_b.derivative_u);
+			if (len_a > 1e-9 && len_b > 1e-9) {
+				double cos_angle = ufbxt_vec3_dot_ref(side_a.derivative_u, side_b.derivative_u)
+					/ (len_a * len_b);
+				if (cos_angle < smallest_tangent_cos) smallest_tangent_cos = cos_angle;
+			}
+		}
+
+		// The induced gap is orders of magnitude above the continuity bounds.
+		ufbxt_assert(largest_position_gap > 0.1);
+		ufbxt_assert(smallest_tangent_cos < 1.0 - 1e-6);
+	}
+
+	// The corrupt seam column is visible directly in the loaded contract.
+	size_t mismatched_seam_points = 0;
+	for (size_t j = 0; j < patch_a->num_control_points_v; j++) {
+		ufbx_vec4 a_seam = patch_a->control_points.data[j * patch_a->num_control_points_u
+			+ (patch_a->num_control_points_u - 1)];
+		ufbx_vec4 b_seam = patch_b->control_points.data[j * patch_b->num_control_points_u];
+		if (ufbxt_vec3_l1(
+			(ufbx_vec3){ a_seam.x, a_seam.y, a_seam.z },
+			(ufbx_vec3){ b_seam.x, b_seam.y, b_seam.z }) > 1e-9
+			|| fabs(a_seam.w - b_seam.w) > 1e-9) {
+			mismatched_seam_points++;
+		}
+	}
+	ufbxt_assert(mismatched_seam_points == patch_a->num_control_points_v);
+
+	ufbx_free_scene(scene);
+}
+#endif
