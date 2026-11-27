@@ -1,0 +1,42 @@
+blender_279_sausage: OK
+maya_game_sausage: OK
+maya_game_sausage_wiggle: OK
+maya_game_sausage_spin: OK
+maya_game_sausage_deform: OK
+maya_game_sausage_combined: OK
+maya_game_sausage_combined_bake: OK
+synthetic_sausage_wiggle_no_link: OK
+synthetic_sausage_wiggle_no_bind: OK
+synthetic_sausage_wiggle_no_link_conversion: OK
+synthetic_sausage_wiggle_no_bind_conversion: OK
+maya_blend_shape_cube: OK
+maya_blend_inbetween: OK
+synthetic_blend_shape_order: OK
+blender_293_half_skinned: OK
+maya_dual_quaternion: OK
+maya_dual_quaternion_scale: OK
+maya_dq_weights: OK
+maya_bone_radius: OK
+blender_279_bone_radius: OK
+synthetic_broken_cluster: OK
+synthetic_broken_cluster_connect: OK
+synthetic_broken_cluster_safe: OK
+max_transformed_skin: OK
+max_transformed_skin_lefthanded: OK
+max_transformed_skin_lefthanded_adjust: OK
+synthetic_bind_to_root: OK
+maya_mixed_inherit_mode: OK
+maya_mixed_inherit_mode_helper: OK
+motionbuilder_sausage_rrss: OK
+motionbuilder_sausage_rrss_helper: OK
+maya_poses: OK
+maya_poses_lefthanded: OK
+blender_331_static_blend_shape: OK
+maya_transformed_skin: OK
+maya_instanced_skin: OK
+blender_279_shape_weights: OK
+blender_279_shape_weights_dom: OK
+blender440_shape_weight_anim: OK
+
+
+Tests passed: 39/39

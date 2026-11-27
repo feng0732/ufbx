@@ -1,0 +1,13 @@
+max7_cube: OK
+max7_cube_normals: OK
+max2009_blob: OK
+max7_skin: OK
+max7_blend_cube: OK
+max6_teapot: OK
+synthetic_legacy_nonzero_material: OK
+synthetic_legacy_unquoted_child_fail: OK
+max2009_cube_texture: OK
+max2009_cube_anim: OK
+
+
+Tests passed: 10/10
